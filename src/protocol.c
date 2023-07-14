@@ -51,9 +51,7 @@ static bool check_host_origin(struct lws *wsi) {
   char buf[256];
   memset(buf, 0, sizeof(buf));
   int len = lws_hdr_copy(wsi, buf, (int)sizeof(buf), WSI_TOKEN_ORIGIN);
-  if (len <= 0) {
-    return false;
-  }
+  if (len <= 0) return false;
 
   const char *prot, *address, *path;
   int port;
@@ -71,26 +69,43 @@ static bool check_host_origin(struct lws *wsi) {
   return len > 0 && strcasecmp(buf, host_buf) == 0;
 }
 
-static void process_read_cb(void *ctx, pty_buf_t *buf, bool eof) {
-  struct pss_tty *pss = (struct pss_tty *)ctx;
-  if (eof && !process_running(pss->process))
-    pss->lws_close_status = pss->process->exit_code == 0 ? 1000 : 1006;
-  else
-    pss->pty_buf = buf;
-
-  lws_callback_on_writable(pss->wsi);
+static pty_ctx_t *pty_ctx_init(struct pss_tty *pss) {
+  pty_ctx_t *ctx = xmalloc(sizeof(pty_ctx_t));
+  ctx->pss = pss;
+  ctx->ws_closed = false;
+  return ctx;
 }
 
-static void process_exit_cb(void *ctx, pty_process *process) {
-  struct pss_tty *pss = (struct pss_tty *)ctx;
-  pss->process = NULL;
-  if (process->killed) {
-    lwsl_notice("process killed with signal %d, pid: %d\n", process->exit_signal, process->pid);
-  } else {
-    lwsl_notice("process exited with code %d, pid: %d\n", process->exit_code, process->pid);
-    pss->lws_close_status = process->exit_code == 0 ? 1000 : 1006;
-    lws_callback_on_writable(pss->wsi);
+static void pty_ctx_free(pty_ctx_t *ctx) { free(ctx); }
+
+static void process_read_cb(pty_process *process, pty_buf_t *buf, bool eof) {
+  pty_ctx_t *ctx = (pty_ctx_t *)process->ctx;
+  if (ctx->ws_closed) {
+    pty_buf_free(buf);
+    return;
   }
+
+  if (eof && !process_running(process))
+    ctx->pss->lws_close_status = process->exit_code == 0 ? 1000 : 1006;
+  else
+    ctx->pss->pty_buf = buf;
+  lws_callback_on_writable(ctx->pss->wsi);
+}
+
+static void process_exit_cb(pty_process *process) {
+  pty_ctx_t *ctx = (pty_ctx_t *)process->ctx;
+  if (ctx->ws_closed) {
+    lwsl_notice("process killed with signal %d, pid: %d\n", process->exit_signal, process->pid);
+    goto done;
+  }
+
+  lwsl_notice("process exited with code %d, pid: %d\n", process->exit_code, process->pid);
+  ctx->pss->process = NULL;
+  ctx->pss->lws_close_status = process->exit_code == 0 ? 1000 : 1006;
+  lws_callback_on_writable(ctx->pss->wsi);
+
+done:
+  pty_ctx_free(ctx);
 }
 
 static char **build_args(struct pss_tty *pss) {
@@ -133,7 +148,7 @@ static char **build_env(struct pss_tty *pss) {
 }
 
 static bool spawn_process(struct pss_tty *pss, uint16_t columns, uint16_t rows) {
-  pty_process *process = process_init((void *)pss, server->loop, build_args(pss), build_env(pss));
+  pty_process *process = process_init((void *)pty_ctx_init(pss), server->loop, build_args(pss), build_env(pss));
   if (server->cwd != NULL) process->cwd = strdup(server->cwd);
   if (columns > 0) process->columns = columns;
   if (rows > 0) process->rows = rows;
@@ -291,7 +306,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
       switch (command) {
         case INPUT:
-          if (server->readonly) break;
+          if (!server->writable) break;
           int err = pty_write(pss->process, pty_buf_init(pss->buffer + 1, pss->len - 1));
           if (err) {
             lwsl_err("uv_write: %s (%s)\n", uv_err_name(err), uv_strerror(err));
@@ -299,6 +314,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           }
           break;
         case RESIZE_TERMINAL:
+          if (pss->process == NULL) break;
           json_object_put(
               parse_window_size(pss->buffer + 1, pss->len - 1, &pss->process->columns, &pss->process->rows));
           pty_resize(pss->process);
@@ -348,17 +364,19 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
 
       server->client_count--;
       lwsl_notice("WS closed from %s, clients: %d\n", pss->address, server->client_count);
-      if (pss->buffer != NULL) {
-        free(pss->buffer);
-      }
+      if (pss->buffer != NULL) free(pss->buffer);
+      if (pss->pty_buf != NULL) pty_buf_free(pss->pty_buf);
       for (int i = 0; i < pss->argc; i++) {
         free(pss->args[i]);
       }
 
-      if (process_running(pss->process)) {
-        pty_pause(pss->process);
-        lwsl_notice("killing process, pid: %d\n", pss->process->pid);
-        pty_kill(pss->process, server->sig_code);
+      if (pss->process != NULL) {
+        ((pty_ctx_t *)pss->process->ctx)->ws_closed = true;
+        if (process_running(pss->process)) {
+          pty_pause(pss->process);
+          lwsl_notice("killing process, pid: %d\n", pss->process->pid);
+          pty_kill(pss->process, server->sig_code);
+        }
       }
 
       if (server->once && server->client_count == 0) {

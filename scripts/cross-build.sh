@@ -10,15 +10,15 @@ STAGE_ROOT="${STAGE_ROOT:-/opt/stage}"
 BUILD_ROOT="${BUILD_ROOT:-/opt/build}"
 BUILD_TARGET="${BUILD_TARGET:-x86_64}"
 
-ZLIB_VERSION="${ZLIB_VERSION:-1.2.11}"
-JSON_C_VERSION="${JSON_C_VERSION:-0.15}"
-MBEDTLS_VERSION="${MBEDTLS_VERSION:-2.16.8}"
-LIBUV_VERSION="${LIBUV_VERSION:-1.40.0}"
-LIBWEBSOCKETS_VERSION="${LIBWEBSOCKETS_VERSION:-4.2.1}"
+ZLIB_VERSION="${ZLIB_VERSION:-1.2.13}"
+JSON_C_VERSION="${JSON_C_VERSION:-0.16}"
+MBEDTLS_VERSION="${MBEDTLS_VERSION:-2.28.1}"
+LIBUV_VERSION="${LIBUV_VERSION:-1.44.2}"
+LIBWEBSOCKETS_VERSION="${LIBWEBSOCKETS_VERSION:-4.3.2}"
 
 build_zlib() {
     echo "=== Building zlib-${ZLIB_VERSION} (${TARGET})..."
-    curl -sLo- "https://zlib.net/zlib-${ZLIB_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
+    curl -fSsLo- "https://zlib.net/zlib-${ZLIB_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
     pushd "${BUILD_DIR}"/zlib-"${ZLIB_VERSION}"
         env CHOST="${TARGET}" ./configure --static --archs="-fPIC" --prefix="${STAGE_DIR}"
         make -j"$(nproc)" install
@@ -27,13 +27,15 @@ build_zlib() {
 
 build_json-c() {
     echo "=== Building json-c-${JSON_C_VERSION} (${TARGET})..."
-    curl -sLo- "https://s3.amazonaws.com/json-c_releases/releases/json-c-${JSON_C_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
+    curl -fSsLo- "https://s3.amazonaws.com/json-c_releases/releases/json-c-${JSON_C_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
     pushd "${BUILD_DIR}/json-c-${JSON_C_VERSION}"
         rm -rf build && mkdir -p build && cd build
         cmake -DCMAKE_TOOLCHAIN_FILE="${BUILD_DIR}/cross-${TARGET}.cmake" \
             -DCMAKE_BUILD_TYPE=RELEASE \
             -DCMAKE_INSTALL_PREFIX="${STAGE_DIR}" \
             -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DDISABLE_THREAD_LOCAL_STORAGE=ON \
             ..
         make -j"$(nproc)" install
     popd
@@ -41,7 +43,7 @@ build_json-c() {
 
 build_mbedtls() {
     echo "=== Building mbedtls-${MBEDTLS_VERSION} (${TARGET})..."
-    curl -sLo- "https://github.com/ARMmbed/mbedtls/archive/v${MBEDTLS_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
+    curl -fSsLo- "https://github.com/ARMmbed/mbedtls/archive/v${MBEDTLS_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
     pushd "${BUILD_DIR}/mbedtls-${MBEDTLS_VERSION}"
         rm -rf build && mkdir -p build && cd build
         cmake -DCMAKE_TOOLCHAIN_FILE="${BUILD_DIR}/cross-${TARGET}.cmake" \
@@ -55,7 +57,7 @@ build_mbedtls() {
 
 build_libuv() {
     echo "=== Building libuv-${LIBUV_VERSION} (${TARGET})..."
-    curl -sLo- "https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
+    curl -fSsLo- "https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
     pushd "${BUILD_DIR}/libuv-v${LIBUV_VERSION}"
         ./autogen.sh
         env CFLAGS=-fPIC ./configure --disable-shared --enable-static --prefix="${STAGE_DIR}" --host="${TARGET}"
@@ -65,7 +67,7 @@ build_libuv() {
 
 install_cmake_cross_file() {
     cat << EOF > "${BUILD_DIR}/cross-${TARGET}.cmake"
-set(CMAKE_SYSTEM_NAME Linux)
+SET(CMAKE_SYSTEM_NAME $1)
 
 set(CMAKE_C_COMPILER "${TARGET}-gcc")
 set(CMAKE_CXX_COMPILER "${TARGET}-g++")
@@ -81,7 +83,7 @@ EOF
 
 build_libwebsockets() {
     echo "=== Building libwebsockets-${LIBWEBSOCKETS_VERSION} (${TARGET})..."
-    curl -sLo- "https://github.com/warmcat/libwebsockets/archive/v${LIBWEBSOCKETS_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
+    curl -fSsLo- "https://github.com/warmcat/libwebsockets/archive/v${LIBWEBSOCKETS_VERSION}.tar.gz" | tar xz -C "${BUILD_DIR}"
     pushd "${BUILD_DIR}/libwebsockets-${LIBWEBSOCKETS_VERSION}"
         sed -i 's/ websockets_shared//g' cmake/libwebsockets-config.cmake.in
         sed -i '/PC_OPENSSL/d' lib/tls/CMakeLists.txt
@@ -130,11 +132,19 @@ build() {
     ALIAS="$2"
     STAGE_DIR="${STAGE_ROOT}/${TARGET}"
     BUILD_DIR="${BUILD_ROOT}/${TARGET}"
+    MUSL_CC_URL="https://github.com/tsl0922/musl-toolchains/releases/download/2021-11-23"
+    COMPONENTS="1"
+    SYSTEM="Linux"
+
+    if [ "$ALIAS" = "win32" ]; then
+        COMPONENTS=2
+        SYSTEM="Windows"
+    fi
 
     echo "=== Installing toolchain ${ALIAS} (${TARGET})..."
 
     mkdir -p "${CROSS_ROOT}" && export PATH="${PATH}:/opt/cross/bin"
-    curl -sLo- "https://musl.cc/${TARGET}-cross.tgz" | tar xz -C "${CROSS_ROOT}" --strip-components 1
+    curl -fSsLo- "${MUSL_CC_URL}/${TARGET}-cross.tgz" | tar xz -C "${CROSS_ROOT}" --strip-components=${COMPONENTS}
 
     echo "=== Building target ${ALIAS} (${TARGET})..."
 
@@ -142,7 +152,7 @@ build() {
     mkdir -p "${STAGE_DIR}" "${BUILD_DIR}"
     export PKG_CONFIG_PATH="${STAGE_DIR}/lib/pkgconfig"
 
-    install_cmake_cross_file
+    install_cmake_cross_file ${SYSTEM}
 
     build_zlib
     build_json-c
@@ -170,6 +180,9 @@ case ${BUILD_TARGET} in
         ;;
     armv7l)
         build armv7l-linux-musleabihf "${BUILD_TARGET}"
+        ;;
+    win32)
+        build x86_64-w64-mingw32 "${BUILD_TARGET}"
         ;;
     *)
         echo "unknown cross target: ${BUILD_TARGET}" && exit 1

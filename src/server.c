@@ -53,6 +53,7 @@ static lws_retry_bo_t retry = {
 // command line options
 static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"interface", required_argument, NULL, 'i'},
+                                        {"socket-owner", required_argument, NULL, 'U'},
                                         {"credential", required_argument, NULL, 'c'},
                                         {"auth-header", required_argument, NULL, 'H'},
                                         {"uid", required_argument, NULL, 'u'},
@@ -70,7 +71,7 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"ssl-key", required_argument, NULL, 'K'},
                                         {"ssl-ca", required_argument, NULL, 'A'},
                                         {"url-arg", no_argument, NULL, 'a'},
-                                        {"readonly", no_argument, NULL, 'R'},
+                                        {"writable", no_argument, NULL, 'W'},
                                         {"terminal-type", required_argument, NULL, 'T'},
                                         {"client-option", required_argument, NULL, 't'},
                                         {"check-origin", no_argument, NULL, 'O'},
@@ -81,7 +82,7 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
                                         {NULL, 0, 0, 0}};
-static const char *opt_string = "p:i:c:H:u:g:s:w:I:b:P:6aSC:K:A:Rt:T:Om:oBd:vh";
+static const char *opt_string = "p:i:U:c:H:u:g:s:w:I:b:P:6aSC:K:A:Wt:T:Om:oBd:vh";
 
 static void print_help() {
   // clang-format off
@@ -93,6 +94,7 @@ static void print_help() {
           "OPTIONS:\n"
           "    -p, --port              Port to listen (default: 7681, use `0` for random port)\n"
           "    -i, --interface         Network interface to bind (eg: eth0), or UNIX domain socket path (eg: /var/run/ttyd.sock)\n"
+          "    -U, --socket-owner      User owner of the UNIX domain socket file, when enabled (eg: user:group)\n"
           "    -c, --credential        Credential for basic authentication (format: username:password)\n"
           "    -H, --auth-header       HTTP Header name for auth proxy, this will configure ttyd to let a HTTP reverse proxy handle authentication\n"
           "    -u, --uid               User id to run with\n"
@@ -100,7 +102,7 @@ static void print_help() {
           "    -s, --signal            Signal to send to the command when exit it (default: 1, SIGHUP)\n"
           "    -w, --cwd               Working directory to be set for the child program\n"
           "    -a, --url-arg           Allow client to send command line arguments in URL (eg: http://localhost:7681?arg=foo&arg=bar)\n"
-          "    -R, --readonly          Do not allow clients to write to the TTY\n"
+          "    -W, --writable          Allow clients to write to the TTY (readonly by default)\n"
           "    -t, --client-option     Send option to client (format: key=value), repeat to add more options\n"
           "    -T, --terminal-type     Terminal type to report, default: xterm-256color\n"
           "    -O, --check-origin      Do not allow websocket connection from different origin\n"
@@ -146,10 +148,11 @@ static void print_config() {
   if (server->auth_header != NULL) lwsl_notice("  auth header: %s\n", server->auth_header);
   if (server->check_origin) lwsl_notice("  check origin: true\n");
   if (server->url_arg) lwsl_notice("  allow url arg: true\n");
-  if (server->readonly) lwsl_notice("  readonly: true\n");
   if (server->max_clients > 0) lwsl_notice("  max clients: %d\n", server->max_clients);
   if (server->once) lwsl_notice("  once: true\n");
   if (server->index != NULL) lwsl_notice("  custom index.html: %s\n", server->index);
+  if (server->cwd != NULL) lwsl_notice("  working directory: %s\n", server->cwd);
+  if (!server->writable) lwsl_notice("The --writable option is not set, will start in readonly mode");
 }
 
 static struct server *server_new(int argc, char **argv, int start) {
@@ -319,10 +322,11 @@ int main(int argc, char **argv) {
 #ifndef LWS_WITHOUT_EXTENSIONS
   info.extensions = extensions;
 #endif
-  info.max_http_header_data = 20480;
+  info.max_http_header_data = 65535;
 
   int debug_level = LLL_ERR | LLL_WARN | LLL_NOTICE;
   char iface[128] = "";
+  char socket_owner[128] = "";
   bool browser = false;
   bool ssl = false;
   char cert_path[1024] = "";
@@ -330,6 +334,10 @@ int main(int argc, char **argv) {
   char ca_path[1024] = "";
 
   struct json_object *client_prefs = json_object_new_object();
+
+#ifdef _WIN32
+  json_object_object_add(client_prefs, "isWindows", json_object_new_boolean(true));
+#endif
 
   // parse command line options
   int c;
@@ -347,8 +355,8 @@ int main(int argc, char **argv) {
       case 'a':
         server->url_arg = true;
         break;
-      case 'R':
-        server->readonly = true;
+      case 'W':
+        server->writable = true;
         break;
       case 'O':
         server->check_origin = true;
@@ -372,6 +380,10 @@ int main(int argc, char **argv) {
       case 'i':
         strncpy(iface, optarg, sizeof(iface) - 1);
         iface[sizeof(iface) - 1] = '\0';
+        break;
+      case 'U':
+        strncpy(socket_owner, optarg, sizeof(socket_owner) - 1);
+        socket_owner[sizeof(socket_owner) - 1] = '\0';
         break;
       case 'c':
         if (strchr(optarg, ':') == NULL) {
@@ -521,6 +533,9 @@ int main(int argc, char **argv) {
       info.options |= LWS_SERVER_OPTION_UNIX_SOCK;
       info.port = 0;  // warmcat/libwebsockets#1985
       strncpy(server->socket_path, info.iface, sizeof(server->socket_path) - 1);
+      if (strlen(socket_owner) > 0) {
+        info.unix_socket_perms = socket_owner;
+      }
 #else
       fprintf(stderr, "libwebsockets is not compiled with UNIX domain socket support");
       return -1;
@@ -532,11 +547,14 @@ int main(int argc, char **argv) {
   if (ssl) {
     info.ssl_cert_filepath = cert_path;
     info.ssl_private_key_filepath = key_path;
+    #ifndef LWS_WITH_MBEDTLS
+    info.ssl_options_set = SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1;
+    #endif
     if (strlen(ca_path) > 0) {
       info.ssl_ca_filepath = ca_path;
       info.options |= LWS_SERVER_OPTION_REQUIRE_VALID_OPENSSL_CLIENT_CERT;
     }
-    info.options |= LWS_SERVER_OPTION_REDIRECT_HTTP_TO_HTTPS;
+    info.options |= LWS_SERVER_OPTION_ALLOW_NON_SSL_ON_SSL_PORT | LWS_SERVER_OPTION_REDIRECT_HTTP_TO_HTTPS;
   }
 #endif
 
